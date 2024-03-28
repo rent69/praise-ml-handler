@@ -26,7 +26,7 @@ class InferenceConfig(BaseModel):
 
 
 class EndpointHandler():
-        def __init__(self):
+    def __init__(self):
 
         device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
         logger.info(f"Using device: {device.type}")
