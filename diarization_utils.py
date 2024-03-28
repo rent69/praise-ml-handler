@@ -2,7 +2,7 @@ import torch
 import numpy as np
 from torchaudio import functional as F
 from transformers.pipelines.audio_utils import ffmpeg_read
-from starlette import HTTPException
+from starlette.exceptions import HTTPException
 import sys
 
 # Code from insanely-fast-whisper:
