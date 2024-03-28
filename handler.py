@@ -51,7 +51,7 @@ class EndpointHandler():
             self.diarization_pipeline = None
             
     
-    async def __call__(self, inputs):
+    def __call__(self, inputs):
         file = inputs.pop("inputs")
         file = base64.b64decode(file)
         parameters = inputs.pop("parameters", {})
