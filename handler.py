@@ -6,66 +6,56 @@ from pyannote.audio import Pipeline
 from transformers import pipeline, AutoModelForCausalLM
 from diarization_utils import diarize
 from huggingface_hub import HfApi
-from transformers.pipelines.audio_utils import ffmpeg_read
-from pydantic import Json, BaseModel, ValidationError
+from pydantic import ValidationError
+from starlette.exceptions import HTTPException
 
+from config import model_settings, InferenceConfig
 
 logger = logging.getLogger(__name__)
 
 
-class InferenceConfig(BaseModel):
-    task: Literal["transcribe", "translate"] = "transcribe"
-    batch_size: int = 24
-    assisted: bool = False
-    chunk_length_s: int = 30
-    sampling_rate: int = 16000
-    language: Optional[str] = None
-    num_speakers: Optional[int] = None
-    min_speakers: Optional[int] = None
-    max_speakers: Optional[int] = None
-
-
 class EndpointHandler():
-    def __init__(self):
+    def __init__(self, model_settings):
 
         device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
         logger.info(f"Using device: {device.type}")
         torch_dtype = torch.float32 if device.type == "cpu" else torch.float16
 
         self.assistant_model = AutoModelForCausalLM.from_pretrained(
-            os.getenv("ASSISTANT_MODEL"),
+            model_settings.assistant_model,
             torch_dtype=torch_dtype,
             low_cpu_mem_usage=True,
             use_safetensors=True
-        ) if os.getenv("ASSISTANT_MODEL") else None
+        ) if model_settings.assistant_model else None
 
         if self.assistant_model:
             self.assistant_model.to(device)
 
         self.asr_pipeline = pipeline(
             "automatic-speech-recognition",
-            model=os.getenv("ASR_MODEL"),
+            model=model_settings.asr_model,
             torch_dtype=torch_dtype,
             device=device
         )
 
-        if os.getenv("DIARIZATION_MODEL"):
+        if model_settings.diarization_model:
             # diarization pipeline doesn't raise if there is no token
             HfApi().whoami(model_settings.hf_token)
             self.diarization_pipeline = Pipeline.from_pretrained(
-                checkpoint_path=os.getenv("DIARIZATION_MODEL"),
-                use_auth_token=os.getenv("HF_TOKEN"),
+                checkpoint_path=model_settings.diarization_model,
+                use_auth_token=model_settings.hf_token,
             )
             self.diarization_pipeline.to(device)
         else:
             self.diarization_pipeline = None
+            
     
     async def __call__(self, file, parameters):
         try:
             parameters = InferenceConfig(**parameters)
         except ValidationError as e:
             logger.error(f"Error validating parameters: {e}")
-            raise ValidationError(f"Error validating parameters: {e}")
+            raise HTTPException(status_code=400, detail=f"Error validating parameters: {e}")
             
         logger.info(f"inference parameters: {parameters}")
 
