@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 
 class EndpointHandler():
-    def __init__(self, model_settings):
+    def __init__(self, path=""):
 
         device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
         logger.info(f"Using device: {device.type}")
