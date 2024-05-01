@@ -9,7 +9,7 @@ API_URL = "<your endpoint URL>"
 filepath = "/path/to/audio"
 
 with open(filepath, 'rb') as f:
-    audio_encoded = base64.b64encode(f.read())
+    audio_encoded = base64.b64encode(f.read()).decode("utf-8")
 
 data = {
     "inputs": audio_encoded,
