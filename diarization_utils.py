@@ -120,19 +120,59 @@ def diarize_audio(diarizer_inputs, diarization_pipeline, parameters):
 
 def extract_speaker_embeddings(diarization_pipeline, diarizer_inputs, diarization_result, sampling_rate=16000):
     """
-    Extract per-speaker embeddings from pyannote's internal embedding model.
+    Extract per-speaker embeddings from pyannote's diarization output.
     
-    pyannote's SpeakerDiarization pipeline has an internal embedding model 
-    (wespeaker-based, 512-dim) that we can access directly. We use the 
-    diarization result to identify which audio regions belong to each speaker,
-    then extract embeddings for those regions.
+    pyannote 4.0 / community-1 DiarizeOutput includes speaker_embeddings
+    as a numpy array of shape (num_speakers, embedding_dim), ordered by
+    speaker_diarization.labels(). We use these directly — no need to
+    probe internal pipeline models.
+    
+    Falls back to internal model probing for pyannote 3.1 which returns
+    a raw Annotation without pre-computed embeddings.
     """
     try:
-        # Access pyannote's internal embedding model
-        # pyannote 3.1: pipeline._embedding
-        # pyannote 4.0/community-1: may be pipeline._embedding or pipeline.embedding
+        annotation, full_output = _extract_annotation(diarization_result)
+        
+        # ── Strategy 1: Use DiarizeOutput.speaker_embeddings (pyannote 4.0+) ──
+        raw_embeddings = getattr(full_output, 'speaker_embeddings', None)
+        if raw_embeddings is not None and isinstance(raw_embeddings, np.ndarray) and raw_embeddings.size > 0:
+            # Get the speaker labels in the same order as the embeddings array
+            # DiarizeOutput.speaker_embeddings is ordered by speaker_diarization.labels()
+            sd_annotation = getattr(full_output, 'speaker_diarization', annotation)
+            labels = sd_annotation.labels()
+            
+            logger.info(f"Using DiarizeOutput.speaker_embeddings: shape={raw_embeddings.shape}, labels={labels}")
+            
+            # Compute per-speaker durations from annotation
+            speaker_durations = {}
+            speaker_seg_counts = {}
+            for segment, _, label in annotation.itertracks(yield_label=True):
+                speaker_durations[label] = speaker_durations.get(label, 0.0) + segment.duration
+                speaker_seg_counts[label] = speaker_seg_counts.get(label, 0) + 1
+            
+            speaker_embeddings = {}
+            for i, label in enumerate(labels):
+                if i >= raw_embeddings.shape[0]:
+                    break
+                emb = raw_embeddings[i].astype(np.float32)
+                # Normalize
+                emb = emb / (np.linalg.norm(emb) + 1e-8)
+                centroid_b64 = base64.b64encode(emb.tobytes()).decode("utf-8")
+                
+                speaker_embeddings[label] = {
+                    "embedding_b64": centroid_b64,
+                    "embedding_dim": int(emb.shape[0]),
+                    "total_seconds": round(speaker_durations.get(label, 0.0), 2),
+                    "num_segments": speaker_seg_counts.get(label, 0),
+                }
+                logger.info(f"Speaker {label}: dim={emb.shape[0]}, {speaker_durations.get(label, 0):.1f}s, {speaker_seg_counts.get(label, 0)} segs")
+            
+            return speaker_embeddings
+        
+        # ── Strategy 2: Probe internal embedding model (pyannote 3.1 fallback) ──
+        logger.info("DiarizeOutput.speaker_embeddings not available, probing internal model...")
         embedding_model = None
-        for attr in ('_embedding', 'embedding', '_segmentation'):
+        for attr in ('_embedding', 'embedding'):
             candidate = getattr(diarization_pipeline, attr, None)
             if candidate is not None and hasattr(candidate, 'parameters'):
                 embedding_model = candidate
@@ -140,23 +180,19 @@ def extract_speaker_embeddings(diarization_pipeline, diarizer_inputs, diarizatio
                 break
         
         if embedding_model is None:
-            logger.error(f"Cannot find embedding model on pipeline. Attributes: {[a for a in dir(diarization_pipeline) if not a.startswith('__')]}")
+            logger.error(f"Cannot find embedding model. Pipeline attrs: {[a for a in dir(diarization_pipeline) if not a.startswith('__')]}")
             return {}
         
         device = next(embedding_model.parameters()).device
         
-        # Extract annotation from diarization result (handles both 3.1 and community-1)
-        annotation, _ = _extract_annotation(diarization_result)
-        
-        # Collect per-speaker audio segments
         speaker_labels = set()
         for segment, _, label in annotation.itertracks(yield_label=True):
             speaker_labels.add(label)
         
         speaker_embeddings = {}
+        waveform = diarizer_inputs  # shape: (1, seq_len)
         
         for speaker in speaker_labels:
-            # Get all segments for this speaker
             speaker_segments = []
             total_seconds = 0.0
             for segment, _, label in annotation.itertracks(yield_label=True):
@@ -165,28 +201,19 @@ def extract_speaker_embeddings(diarization_pipeline, diarizer_inputs, diarizatio
                     total_seconds += segment.duration
             
             if total_seconds < 0.5:
-                logger.warning(f"Speaker {speaker} has only {total_seconds:.1f}s of audio, skipping embedding")
                 continue
             
-            # Extract audio for each segment and compute embeddings
             segment_embeddings = []
-            waveform = diarizer_inputs  # shape: (1, seq_len)
-            
             for seg in speaker_segments:
                 start_sample = int(seg.start * sampling_rate)
                 end_sample = int(seg.end * sampling_rate)
-                
                 if end_sample > waveform.shape[1]:
                     end_sample = waveform.shape[1]
-                if end_sample - start_sample < sampling_rate * 0.3:  # skip < 0.3s
+                if end_sample - start_sample < sampling_rate * 0.3:
                     continue
-                    
                 chunk = waveform[:, start_sample:end_sample].to(device)
-                
                 with torch.no_grad():
                     emb = embedding_model(chunk)
-                
-                # Normalize
                 if emb.dim() > 1:
                     emb = emb.squeeze()
                 emb = emb / (torch.norm(emb) + 1e-8)
@@ -194,12 +221,9 @@ def extract_speaker_embeddings(diarization_pipeline, diarizer_inputs, diarizatio
             
             if len(segment_embeddings) == 0:
                 continue
-                
-            # Compute centroid (mean of all segment embeddings)
+            
             centroid = np.mean(segment_embeddings, axis=0).astype(np.float32)
             centroid = centroid / (np.linalg.norm(centroid) + 1e-8)
-            
-            # Encode as base64
             centroid_b64 = base64.b64encode(centroid.tobytes()).decode("utf-8")
             
             speaker_embeddings[speaker] = {
@@ -208,8 +232,7 @@ def extract_speaker_embeddings(diarization_pipeline, diarizer_inputs, diarizatio
                 "total_seconds": round(total_seconds, 2),
                 "num_segments": len(segment_embeddings),
             }
-            
-            logger.info(f"Speaker {speaker}: {total_seconds:.1f}s, {len(segment_embeddings)} segments, dim={centroid.shape[0]}")
+            logger.info(f"Speaker {speaker}: {total_seconds:.1f}s, {len(segment_embeddings)} segs, dim={centroid.shape[0]}")
         
         return speaker_embeddings
         
