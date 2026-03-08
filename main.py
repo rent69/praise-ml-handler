@@ -342,4 +342,26 @@ def process(request: ProcessRequest):
     if speaker_matches:
         response["speaker_matches"] = speaker_matches
 
+    # Force GPU memory cleanup after every request to prevent OOM on consecutive chunks
+    import gc
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     return response
+
+
+
+@app.post("/cleanup")
+def cleanup():
+    """Force GPU memory cleanup between chunks.
+    Called by analyze-service between chunked processing passes."""
+    import gc
+    gc.collect()
+    if torch.cuda.is_available():
+        before = torch.cuda.memory_allocated() / 1e9
+        torch.cuda.empty_cache()
+        after = torch.cuda.memory_allocated() / 1e9
+        logger.info(f"[cleanup] GPU memory: {before:.2f}GB → {after:.2f}GB")
+        return {"status": "ok", "gpu_mem_before_gb": round(before, 2), "gpu_mem_after_gb": round(after, 2)}
+    return {"status": "ok", "gpu": "not available"}
