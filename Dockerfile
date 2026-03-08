@@ -1,12 +1,10 @@
 FROM pytorch/pytorch:2.8.0-cuda12.8-cudnn9-runtime
 
-# Install ffmpeg shared libraries via conda (the base image is conda-based).
-# torchcodec needs libavutil/libavcodec/libavformat .so files at runtime —
-# conda's ffmpeg package provides these in the correct paths.
-# We also install git (needed by pip for some deps).
-RUN conda install -y -c conda-forge ffmpeg && \
-    conda clean -afy && \
-    apt-get update && apt-get install -y --no-install-recommends git && \
+# Install system deps: ffmpeg CLI (used by transformers ffmpeg_read fallback
+# and pyannote's torchaudio), git (pip needs it for some deps).
+# We do NOT use torchcodec — it requires ffmpeg shared libs that conflict
+# with this base image. transformers auto-falls back to subprocess ffmpeg.
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg git && \
     rm -rf /var/lib/apt/lists/*
 
 # Create non-root user

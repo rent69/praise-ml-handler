@@ -2,10 +2,10 @@
 # Its torch==2.8.0 pin matches our pytorch/pytorch:2.8.0 base image
 pyannote-audio==4.0.4
 
-# torchcodec 0.7.0 — audio decoding for transformers ASR pipeline
-# MUST match PyTorch version: 0.6/0.7 for torch 2.8 (see compatibility table)
-# https://github.com/pytorch/torchcodec?tab=readme-ov-file#installing-torchcodec
-torchcodec==0.7.0
+# NOTE: torchcodec intentionally NOT installed.
+# transformers auto-falls back to ffmpeg_read (subprocess) which works
+# with the apt-installed ffmpeg binary. torchcodec needs ffmpeg shared
+# libs (.so) that conflict with the pytorch base image.
 
 # ASR
 transformers>=4.48.0
