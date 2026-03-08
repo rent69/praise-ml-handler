@@ -1,0 +1,15 @@
+# pyannote-audio 4.0.4 — supports community-1 pipeline
+# Its torch==2.8.0 pin matches our pytorch/pytorch:2.8.0 base image
+pyannote-audio==4.0.4
+
+# ASR
+transformers>=4.48.0
+accelerate>=0.27.2
+
+# Server
+fastapi[standard]
+uvicorn
+
+# Config
+pydantic>=2.6.3
+pydantic-settings>=2.2.1

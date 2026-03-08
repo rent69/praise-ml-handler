@@ -1,0 +1,10 @@
+.git
+.github
+.gitattributes
+docker/
+handler.py
+requirements.txt
+README.md
+*.md
+__pycache__
+*.pyc

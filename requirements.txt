@@ -1,8 +1,17 @@
+# Pin torch ecosystem to match HF Inference Endpoints container (torch 2.2.0, CUDA 12.3)
+# DO NOT use >= for torch — the container has torchvision pre-installed against 2.2.x
+torch==2.2.0
+torchaudio==2.2.0
+
+# pyannote-audio 4.0+ required for community-1 pipeline
+# torchcodec is a dependency of pyannote 4.0 — needs torch 2.2+
+pyannote-audio==4.0.4
+
+# Match container versions where possible
 accelerate==0.27.2
-torch==2.2.1
-pyannote-audio==3.1.1
-transformers==4.38.2
-numpy==1.26.4
-torchaudio==2.2.1
-pydantic==2.6.3
-pydantic-settings==2.2.1
+transformers==4.48.0
+numpy<2.0
+
+# Config + validation
+pydantic>=2.6.3
+pydantic-settings>=2.2.1
