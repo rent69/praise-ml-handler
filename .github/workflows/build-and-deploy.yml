@@ -56,80 +56,36 @@ jobs:
     if: github.ref == 'refs/heads/main'
 
     steps:
-      - name: Deploy or update HF Inference Endpoint
+      - name: Deploy to HF Inference Endpoint
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          IMAGE_TAG: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          # Use sha-<7chars> tag from Docker metadata action
+          IMAGE_TAG: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
         run: |
-          echo "Checking for existing endpoint..."
-          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-            https://api.endpoints.huggingface.cloud/v2/endpoint/ADGIT/praise-ml \
-            -H "Authorization: Bearer $HF_TOKEN")
+          # Extract 7-char SHA (matches Docker metadata type=sha format)
+          SHORT_SHA=$(echo "$GITHUB_SHA" | cut -c1-7)
+          FULL_IMAGE="ghcr.io/rent69/praise-ml-handler:sha-${SHORT_SHA}"
+          echo "Deploying image: ${FULL_IMAGE}"
           
-          if [ "$STATUS" = "200" ]; then
-            echo "Updating existing endpoint with new image..."
-            curl -s -X PUT \
-              https://api.endpoints.huggingface.cloud/v2/endpoint/ADGIT/praise-ml \
-              -H "Authorization: Bearer $HF_TOKEN" \
-              -H "Content-Type: application/json" \
-              -d "{
-                \"model\": {
-                  \"repository\": \"ADGIT/praise-ml-handler\",
-                  \"task\": \"custom\",
-                  \"framework\": \"pytorch\"
-                },
-                \"custom_image\": {
-                  \"url\": \"${IMAGE_TAG}\",
-                  \"health_route\": \"/health\",
-                  \"port\": 8000,
-                  \"env\": {
-                    \"ASR_MODEL\": \"openai/whisper-large-v3\",
-                    \"DIARIZATION_MODEL\": \"pyannote/speaker-diarization-community-1\",
-                    \"ASSISTANT_MODEL\": \"distil-whisper/distil-large-v3\"
+          # Update endpoint with new image — uses model.image.custom format
+          # Model defaults (ASR_MODEL, DIARIZATION_MODEL) come from Dockerfile,
+          # NOT from HF env vars — this avoids stale overrides.
+          RESULT=$(curl -s -X PUT \
+            https://api.endpoints.huggingface.cloud/v2/endpoint/ADGIT/praise-ml \
+            -H "Authorization: Bearer $HF_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"model\": {
+                \"image\": {
+                  \"custom\": {
+                    \"url\": \"${FULL_IMAGE}\",
+                    \"healthRoute\": \"/health\",
+                    \"port\": 8000
                   }
                 }
-              }"
-          else
-            echo "Creating new endpoint..."
-            curl -s -X POST \
-              https://api.endpoints.huggingface.cloud/v2/endpoint/ADGIT \
-              -H "Authorization: Bearer $HF_TOKEN" \
-              -H "Content-Type: application/json" \
-              -d "{
-                \"compute\": {
-                  \"accelerator\": \"gpu\",
-                  \"instanceSize\": \"x1\",
-                  \"instanceType\": \"nvidia-t4\",
-                  \"scaling\": {
-                    \"maxReplica\": 1,
-                    \"minReplica\": 0
-                  }
-                },
-                \"model\": {
-                  \"repository\": \"ADGIT/praise-ml-handler\",
-                  \"task\": \"custom\",
-                  \"framework\": \"pytorch\"
-                },
-                \"custom_image\": {
-                  \"url\": \"${IMAGE_TAG}\",
-                  \"health_route\": \"/health\",
-                  \"port\": 8000,
-                  \"env\": {
-                    \"ASR_MODEL\": \"openai/whisper-large-v3\",
-                    \"DIARIZATION_MODEL\": \"pyannote/speaker-diarization-community-1\",
-                    \"ASSISTANT_MODEL\": \"distil-whisper/distil-large-v3\"
-                  }
-                },
-                \"secrets\": {
-                  \"HF_TOKEN\": \"${HF_TOKEN}\"
-                },
-                \"name\": \"praise-ml\",
-                \"provider\": {
-                  \"region\": \"us-east-1\",
-                  \"vendor\": \"aws\"
-                },
-                \"type\": \"private\"
-              }"
-          fi
-          echo ""
-          echo "Deploy step complete."
+              }
+            }")
+          
+          STATE=$(echo "$RESULT" | python3 -c "import json,sys; print(json.load(sys.stdin).get('status',{}).get('state','unknown'))" 2>/dev/null || echo "parse_error")
+          echo "Endpoint state: ${STATE}"
+          echo "Deploy complete."
