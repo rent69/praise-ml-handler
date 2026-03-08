@@ -133,6 +133,13 @@ def extract_speaker_embeddings(diarization_pipeline, diarizer_inputs, diarizatio
     try:
         annotation, full_output = _extract_annotation(diarization_result)
         
+        # Debug: log what attributes the output has
+        output_attrs = [a for a in dir(full_output) if not a.startswith('_')]
+        logger.info(f"DiarizeOutput attributes: {output_attrs}")
+        logger.info(f"DiarizeOutput type: {type(full_output)}")
+        raw_emb_attr = getattr(full_output, 'speaker_embeddings', 'MISSING')
+        logger.info(f"speaker_embeddings attr: type={type(raw_emb_attr)}, value={raw_emb_attr if not isinstance(raw_emb_attr, np.ndarray) else f'ndarray shape={raw_emb_attr.shape}'}")
+        
         # ── Strategy 1: Use DiarizeOutput.speaker_embeddings (pyannote 4.0+) ──
         raw_embeddings = getattr(full_output, 'speaker_embeddings', None)
         if raw_embeddings is not None and isinstance(raw_embeddings, np.ndarray) and raw_embeddings.size > 0:

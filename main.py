@@ -262,6 +262,35 @@ def health() -> HealthResponse:
     )
 
 
+@app.get("/debug")
+def debug():
+    """Debug endpoint: inspect diarization pipeline internals."""
+    import inspect
+    pipeline = model_manager.diarization_pipeline
+    if pipeline is None:
+        return {"error": "diarization pipeline not loaded"}
+    
+    attrs = [a for a in dir(pipeline) if not a.startswith('__')]
+    
+    # Check if a quick run reveals the output structure
+    info = {
+        "pipeline_type": str(type(pipeline)),
+        "pipeline_attrs": attrs,
+        "has_embedding": hasattr(pipeline, '_embedding'),
+        "has_embedding_public": hasattr(pipeline, 'embedding'),
+    }
+    
+    # Try to find the DiarizeOutput class
+    try:
+        from pyannote.audio.pipelines.speaker_diarization import DiarizeOutput
+        fields = [f.name for f in DiarizeOutput.__dataclass_fields__.values()] if hasattr(DiarizeOutput, '__dataclass_fields__') else dir(DiarizeOutput)
+        info["DiarizeOutput_fields"] = fields
+    except ImportError:
+        info["DiarizeOutput_fields"] = "import failed"
+    
+    return info
+
+
 @app.post("/")
 def process(request: ProcessRequest):
     """Main inference endpoint — ASR + diarization + embeddings + matching.
@@ -339,6 +368,8 @@ def process(request: ProcessRequest):
     }
     if speaker_embeddings:
         response["speaker_embeddings"] = speaker_embeddings
+    else:
+        response["_debug_embeddings"] = "empty — extraction returned no embeddings"
     if speaker_matches:
         response["speaker_matches"] = speaker_matches
 
