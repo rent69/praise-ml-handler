@@ -5,7 +5,7 @@ import base64
 
 from pyannote.audio import Pipeline
 from transformers import pipeline, AutoModelForCausalLM
-from diarization_utils import diarize
+from diarization_utils import diarize, diarize_with_embeddings
 from huggingface_hub import HfApi
 from pydantic import ValidationError
 from starlette.exceptions import HTTPException
@@ -49,8 +49,8 @@ class EndpointHandler():
             self.diarization_pipeline.to(device)
         else:
             self.diarization_pipeline = None
-            
-    
+
+
     def __call__(self, inputs):
         file = inputs.pop("inputs")
         file = base64.b64decode(file)
@@ -60,15 +60,16 @@ class EndpointHandler():
         except ValidationError as e:
             logger.error(f"Error validating parameters: {e}")
             raise HTTPException(status_code=400, detail=f"Error validating parameters: {e}")
-            
+
         logger.info(f"inference parameters: {parameters}")
 
         generate_kwargs = {
-            "task": parameters.task, 
+            "task": parameters.task,
             "language": parameters.language,
             "assistant_model": self.assistant_model if parameters.assisted else None
         }
 
+        # --- ASR ---
         try:
             asr_outputs = self.asr_pipeline(
                 file,
@@ -81,23 +82,44 @@ class EndpointHandler():
             logger.error(f"ASR inference error: {str(e)}")
             raise HTTPException(status_code=400, detail=f"ASR inference error: {str(e)}")
         except Exception as e:
-            logger.error(f"Unknown error diring ASR inference: {str(e)}")
-            raise HTTPException(status_code=500, detail=f"Unknown error diring ASR inference: {str(e)}")
+            logger.error(f"Unknown error during ASR inference: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Unknown error during ASR inference: {str(e)}")
+
+        # --- Diarization ---
+        speaker_embeddings = {}
+        speaker_matches = {}
+        transcript = []
 
         if self.diarization_pipeline:
+            use_extended = parameters.return_embeddings or parameters.known_speakers
+            
             try:
-                transcript = diarize(self.diarization_pipeline, file, parameters, asr_outputs)
+                if use_extended:
+                    transcript, speaker_embeddings, speaker_matches = diarize_with_embeddings(
+                        self.diarization_pipeline, file, parameters, asr_outputs
+                    )
+                else:
+                    transcript = diarize(self.diarization_pipeline, file, parameters, asr_outputs)
             except RuntimeError as e:
                 logger.error(f"Diarization inference error: {str(e)}")
                 raise HTTPException(status_code=400, detail=f"Diarization inference error: {str(e)}")
             except Exception as e:
                 logger.error(f"Unknown error during diarization: {str(e)}")
                 raise HTTPException(status_code=500, detail=f"Unknown error during diarization: {str(e)}")
-        else:
-            transcript = []
 
-        return {
+        # --- Response ---
+        response = {
             "speakers": transcript,
             "chunks": asr_outputs["chunks"],
             "text": asr_outputs["text"],
         }
+
+        # Include embeddings if requested
+        if speaker_embeddings:
+            response["speaker_embeddings"] = speaker_embeddings
+
+        # Include matches if known speakers were provided
+        if speaker_matches:
+            response["speaker_matches"] = speaker_matches
+
+        return response
