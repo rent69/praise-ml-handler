@@ -141,6 +141,15 @@ def resolve_audio_bytes(request: ProcessRequest) -> bytes:
 # Model Manager
 # ------------------------------------------------------
 class ModelManager:
+    """Manages ASR + diarization models with GPU memory swapping.
+    
+    T4 has 15GB VRAM. Whisper large-v3 (~3GB) + pyannote community-1 (~11GB)
+    together exceed available memory for inference. We load both but swap
+    them on/off GPU sequentially during processing:
+    
+    1. ASR on GPU, diarization on CPU  → transcribe
+    2. ASR to CPU, diarization to GPU  → diarize + embeddings
+    """
     def __init__(self):
         self.asr_pipeline = None
         self.assistant_model = None
@@ -148,9 +157,9 @@ class ModelManager:
 
     async def load(self):
         start = time.perf_counter()
-        logger.info(f"Loading models on {DEVICE} ({TORCH_DTYPE})...")
+        logger.info(f"Loading models (sequential GPU strategy for T4)...")
 
-        # ASR pipeline
+        # Load ASR to GPU first
         logger.info(f"Loading ASR model: {ASR_MODEL}")
         self.asr_pipeline = hf_pipeline(
             "automatic-speech-recognition",
@@ -159,27 +168,58 @@ class ModelManager:
             device=DEVICE,
         )
 
-        # Assistant model for speculative decoding (optional)
-        if ASSISTANT_MODEL:
-            logger.info(f"Loading assistant model: {ASSISTANT_MODEL}")
-            self.assistant_model = AutoModelForCausalLM.from_pretrained(
-                ASSISTANT_MODEL,
-                torch_dtype=TORCH_DTYPE,
-                low_cpu_mem_usage=True,
-                use_safetensors=True,
-            ).to(DEVICE)
-
-        # Diarization pipeline
+        # Load diarization to CPU initially (will move to GPU when needed)
         if DIARIZATION_MODEL:
-            logger.info(f"Loading diarization model: {DIARIZATION_MODEL}")
+            logger.info(f"Loading diarization model to CPU: {DIARIZATION_MODEL}")
             self.diarization_pipeline = Pipeline.from_pretrained(
                 DIARIZATION_MODEL,
                 token=HF_TOKEN,
             )
-            self.diarization_pipeline.to(DEVICE)
+            # Keep on CPU — will move to GPU after ASR completes
+            logger.info("Diarization pipeline loaded on CPU")
 
         duration = time.perf_counter() - start
         logger.info(f"All models loaded in {duration:.1f}s")
+        if torch.cuda.is_available():
+            mem = torch.cuda.memory_allocated() / 1e9
+            logger.info(f"GPU memory after load: {mem:.1f}GB")
+
+    def swap_to_asr(self):
+        """Ensure ASR is on GPU, diarization on CPU."""
+        if self.diarization_pipeline is not None:
+            self.diarization_pipeline.to(torch.device("cpu"))
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        # ASR pipeline stays on GPU (loaded there initially)
+        if torch.cuda.is_available():
+            mem = torch.cuda.memory_allocated() / 1e9
+            logger.info(f"[swap_to_asr] GPU mem: {mem:.1f}GB")
+
+    def swap_to_diarization(self):
+        """Move ASR off GPU, diarization onto GPU."""
+        # Move ASR model to CPU
+        if self.asr_pipeline is not None:
+            self.asr_pipeline.model.to("cpu")
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        # Move diarization to GPU
+        if self.diarization_pipeline is not None:
+            self.diarization_pipeline.to(DEVICE)
+        if torch.cuda.is_available():
+            mem = torch.cuda.memory_allocated() / 1e9
+            logger.info(f"[swap_to_diarization] GPU mem: {mem:.1f}GB")
+
+    def restore_asr_to_gpu(self):
+        """After processing, restore ASR to GPU for next request."""
+        if self.diarization_pipeline is not None:
+            self.diarization_pipeline.to(torch.device("cpu"))
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        if self.asr_pipeline is not None:
+            self.asr_pipeline.model.to(DEVICE)
+        if torch.cuda.is_available():
+            mem = torch.cuda.memory_allocated() / 1e9
+            logger.info(f"[restore_asr] GPU mem: {mem:.1f}GB")
 
     async def unload(self):
         del self.asr_pipeline
@@ -240,13 +280,13 @@ def process(request: ProcessRequest):
     resolve_time = time.perf_counter() - start
     logger.info(f"Audio resolved: {len(audio_bytes)} bytes in {resolve_time:.1f}s")
 
-    # ASR
+    # ── Phase 1: ASR (Whisper on GPU, diarization on CPU) ──────────────
+    model_manager.swap_to_asr()
+
     generate_kwargs = {
         "task": request.task,
         "language": request.language,
     }
-    if request.assisted and model_manager.assistant_model:
-        generate_kwargs["assistant_model"] = model_manager.assistant_model
 
     try:
         asr_outputs = model_manager.asr_pipeline(
@@ -258,17 +298,19 @@ def process(request: ProcessRequest):
         )
     except Exception as e:
         logger.error(f"ASR error: {e}")
+        model_manager.restore_asr_to_gpu()
         raise HTTPException(status_code=500, detail=f"ASR inference error: {e}")
 
     asr_time = time.perf_counter() - start - resolve_time
     logger.info(f"ASR complete in {asr_time:.1f}s")
 
-    # Diarization + embeddings + matching
+    # ── Phase 2: Diarization (pyannote on GPU, Whisper on CPU) ─────────
     speaker_embeddings = {}
     speaker_matches = {}
     transcript = []
 
     if model_manager.diarization_pipeline:
+        model_manager.swap_to_diarization()
         try:
             transcript, speaker_embeddings, speaker_matches = diarize_with_embeddings(
                 model_manager.diarization_pipeline,
@@ -278,9 +320,13 @@ def process(request: ProcessRequest):
             )
         except Exception as e:
             logger.error(f"Diarization error: {e}")
+            model_manager.restore_asr_to_gpu()
             raise HTTPException(
                 status_code=500, detail=f"Diarization error: {e}"
             )
+
+    # ── Restore ASR to GPU for next request ────────────────────────────
+    model_manager.restore_asr_to_gpu()
 
     total_time = time.perf_counter() - start
     logger.info(f"Total processing: {total_time:.1f}s — {len(transcript)} segments")
