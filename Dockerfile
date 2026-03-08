@@ -9,6 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg git && \
 
 # Create non-root user
 ENV USER=appuser HOME=/home/appuser
+ENV PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 RUN useradd -m -s /bin/bash $USER
 
 WORKDIR /app

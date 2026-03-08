@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 TORCH_DTYPE = torch.float32 if DEVICE.type == "cpu" else torch.float16
 
-ASR_MODEL = os.environ.get("ASR_MODEL", "openai/whisper-large-v3")
+ASR_MODEL = os.environ.get("ASR_MODEL", "distil-whisper/distil-large-v3")
 ASSISTANT_MODEL = os.environ.get("ASSISTANT_MODEL", None)
 DIARIZATION_MODEL = os.environ.get(
     "DIARIZATION_MODEL", "pyannote/speaker-diarization-community-1"
@@ -60,7 +60,7 @@ class ProcessRequest(BaseModel):
     audio_url: Optional[str] = Field(None, description="Public URL to audio file (downloaded by endpoint)")
     task: str = "transcribe"
     language: Optional[str] = "en"
-    batch_size: int = 24
+    batch_size: int = 12
     chunk_length_s: int = 30
     assisted: bool = False
     sampling_rate: int = 16000
