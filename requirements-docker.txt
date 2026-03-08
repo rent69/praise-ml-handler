@@ -15,6 +15,9 @@ accelerate>=0.27.2
 fastapi[standard]
 uvicorn
 
+# HTTP client (for audio_url downloads)
+httpx
+
 # Config
 pydantic>=2.6.3
 pydantic-settings>=2.2.1

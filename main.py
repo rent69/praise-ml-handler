@@ -8,9 +8,11 @@ import logging
 import time
 import base64
 import os
+import tempfile
 from contextlib import asynccontextmanager
 from typing import Optional, List
 
+import httpx
 import torch
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
@@ -53,7 +55,9 @@ class KnownSpeaker(BaseModel):
 
 
 class ProcessRequest(BaseModel):
-    inputs: str = Field(..., description="Base64-encoded audio bytes")
+    # Audio input — provide EITHER inputs (base64) OR audio_url (public URL)
+    inputs: Optional[str] = Field(None, description="Base64-encoded audio bytes")
+    audio_url: Optional[str] = Field(None, description="Public URL to audio file (downloaded by endpoint)")
     task: str = "transcribe"
     language: Optional[str] = "en"
     batch_size: int = 24
@@ -72,6 +76,65 @@ class HealthResponse(BaseModel):
     device: str
     asr_model: str
     diarization_model: Optional[str]
+
+
+# ------------------------------------------------------
+# Audio resolution — base64 or URL download
+# ------------------------------------------------------
+MAX_AUDIO_SIZE = 500 * 1024 * 1024  # 500MB limit for URL downloads
+DOWNLOAD_TIMEOUT = 300  # 5 min timeout for large files
+
+
+def resolve_audio_bytes(request: ProcessRequest) -> bytes:
+    """Resolve audio bytes from either base64 input or URL download."""
+    if request.inputs and request.audio_url:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide either 'inputs' (base64) or 'audio_url', not both"
+        )
+
+    if request.inputs:
+        try:
+            return base64.b64decode(request.inputs)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Invalid base64 audio: {e}")
+
+    if request.audio_url:
+        logger.info(f"Downloading audio from URL: {request.audio_url[:100]}...")
+        start = time.perf_counter()
+        try:
+            with httpx.Client(timeout=DOWNLOAD_TIMEOUT, follow_redirects=True) as client:
+                resp = client.get(request.audio_url)
+                resp.raise_for_status()
+                audio_bytes = resp.content
+                if len(audio_bytes) > MAX_AUDIO_SIZE:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Audio file too large: {len(audio_bytes)} bytes (max {MAX_AUDIO_SIZE})"
+                    )
+                duration = time.perf_counter() - start
+                logger.info(f"Downloaded {len(audio_bytes)} bytes in {duration:.1f}s")
+                return audio_bytes
+        except httpx.HTTPStatusError as e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Failed to download audio: HTTP {e.response.status_code}"
+            )
+        except httpx.TimeoutException:
+            raise HTTPException(
+                status_code=408,
+                detail=f"Audio download timed out after {DOWNLOAD_TIMEOUT}s"
+            )
+        except Exception as e:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Audio download error: {e}"
+            )
+
+    raise HTTPException(
+        status_code=400,
+        detail="Must provide either 'inputs' (base64) or 'audio_url'"
+    )
 
 
 # ------------------------------------------------------
@@ -161,17 +224,21 @@ def health() -> HealthResponse:
 
 @app.post("/")
 def process(request: ProcessRequest):
-    """Main inference endpoint — ASR + diarization + embeddings + matching."""
+    """Main inference endpoint — ASR + diarization + embeddings + matching.
+    
+    Accepts audio as either base64 (inputs field) or a public URL (audio_url field).
+    The URL path avoids base64 encoding overhead for large files and lets the 
+    GPU endpoint pull audio directly from R2/CDN.
+    """
     start = time.perf_counter()
 
     if model_manager.asr_pipeline is None:
         raise HTTPException(status_code=503, detail="Models not loaded")
 
-    # Decode audio
-    try:
-        audio_bytes = base64.b64decode(request.inputs)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid base64 audio: {e}")
+    # Resolve audio bytes from base64 or URL
+    audio_bytes = resolve_audio_bytes(request)
+    resolve_time = time.perf_counter() - start
+    logger.info(f"Audio resolved: {len(audio_bytes)} bytes in {resolve_time:.1f}s")
 
     # ASR
     generate_kwargs = {
@@ -193,6 +260,9 @@ def process(request: ProcessRequest):
         logger.error(f"ASR error: {e}")
         raise HTTPException(status_code=500, detail=f"ASR inference error: {e}")
 
+    asr_time = time.perf_counter() - start - resolve_time
+    logger.info(f"ASR complete in {asr_time:.1f}s")
+
     # Diarization + embeddings + matching
     speaker_embeddings = {}
     speaker_matches = {}
@@ -212,13 +282,14 @@ def process(request: ProcessRequest):
                 status_code=500, detail=f"Diarization error: {e}"
             )
 
-    duration = time.perf_counter() - start
-    logger.info(f"Processed in {duration:.1f}s — {len(transcript)} segments")
+    total_time = time.perf_counter() - start
+    logger.info(f"Total processing: {total_time:.1f}s — {len(transcript)} segments")
 
     response = {
         "text": asr_outputs["text"],
         "chunks": asr_outputs["chunks"],
         "speakers": transcript,
+        "processing_time_s": round(total_time, 2),
     }
     if speaker_embeddings:
         response["speaker_embeddings"] = speaker_embeddings
