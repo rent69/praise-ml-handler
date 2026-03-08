@@ -32,16 +32,48 @@ def preprocess_inputs(inputs, sampling_rate):
     return inputs, diarizer_inputs
 
 
+def _extract_annotation(diarization_output):
+    """
+    Extract a pyannote Annotation object from the pipeline output.
+    
+    pyannote 3.1 returns an Annotation directly (has .itertracks()).
+    pyannote 4.0 / community-1 returns a DiarizationOutput object with
+    .speaker_diarization and .exclusive_speaker_diarization attributes.
+    We prefer exclusive_speaker_diarization when available (better for
+    reconciling with ASR timestamps).
+    """
+    # community-1 / pyannote 4.0 output object
+    if hasattr(diarization_output, 'speaker_diarization'):
+        # Prefer exclusive_speaker_diarization when available (better for ASR reconciliation)
+        excl = getattr(diarization_output, 'exclusive_speaker_diarization', None)
+        if excl is not None:
+            logger.info("Using exclusive_speaker_diarization from community-1 output")
+            return excl, diarization_output
+        annotation = diarization_output.speaker_diarization
+        logger.info("Using speaker_diarization from community-1 output")
+        return annotation, diarization_output
+    
+    # pyannote 3.1 returns Annotation directly (has .itertracks)
+    if hasattr(diarization_output, 'itertracks'):
+        logger.info("Using legacy Annotation output (pyannote 3.1 style)")
+        return diarization_output, diarization_output
+    
+    raise ValueError(f"Unexpected diarization output type: {type(diarization_output)}. "
+                     f"Attributes: {dir(diarization_output)}")
+
+
 def diarize_audio(diarizer_inputs, diarization_pipeline, parameters):
-    diarization = diarization_pipeline(
+    raw_output = diarization_pipeline(
         {"waveform": diarizer_inputs, "sample_rate": parameters.sampling_rate},
         num_speakers=parameters.num_speakers,
         min_speakers=parameters.min_speakers,
         max_speakers=parameters.max_speakers,
     )
 
+    annotation, full_output = _extract_annotation(raw_output)
+
     segments = []
-    for segment, track, label in diarization.itertracks(yield_label=True):
+    for segment, track, label in annotation.itertracks(yield_label=True):
         segments.append(
             {
                 "segment": {"start": segment.start, "end": segment.end},
@@ -49,6 +81,10 @@ def diarize_audio(diarizer_inputs, diarization_pipeline, parameters):
                 "label": label,
             }
         )
+
+    if len(segments) == 0:
+        logger.warning("Diarization returned 0 segments")
+        return [], full_output
 
     # Combine consecutive segments from the same speaker
     new_segments = []
@@ -79,7 +115,7 @@ def diarize_audio(diarizer_inputs, diarization_pipeline, parameters):
         }
     )
 
-    return new_segments, diarization
+    return new_segments, full_output
 
 
 def extract_speaker_embeddings(diarization_pipeline, diarizer_inputs, diarization_result, sampling_rate=16000):
@@ -93,12 +129,28 @@ def extract_speaker_embeddings(diarization_pipeline, diarizer_inputs, diarizatio
     """
     try:
         # Access pyannote's internal embedding model
-        embedding_model = diarization_pipeline._embedding
+        # pyannote 3.1: pipeline._embedding
+        # pyannote 4.0/community-1: may be pipeline._embedding or pipeline.embedding
+        embedding_model = None
+        for attr in ('_embedding', 'embedding', '_segmentation'):
+            candidate = getattr(diarization_pipeline, attr, None)
+            if candidate is not None and hasattr(candidate, 'parameters'):
+                embedding_model = candidate
+                logger.info(f"Found embedding model via pipeline.{attr}")
+                break
+        
+        if embedding_model is None:
+            logger.error(f"Cannot find embedding model on pipeline. Attributes: {[a for a in dir(diarization_pipeline) if not a.startswith('__')]}")
+            return {}
+        
         device = next(embedding_model.parameters()).device
+        
+        # Extract annotation from diarization result (handles both 3.1 and community-1)
+        annotation, _ = _extract_annotation(diarization_result)
         
         # Collect per-speaker audio segments
         speaker_labels = set()
-        for segment, _, label in diarization_result.itertracks(yield_label=True):
+        for segment, _, label in annotation.itertracks(yield_label=True):
             speaker_labels.add(label)
         
         speaker_embeddings = {}
@@ -107,7 +159,7 @@ def extract_speaker_embeddings(diarization_pipeline, diarizer_inputs, diarizatio
             # Get all segments for this speaker
             speaker_segments = []
             total_seconds = 0.0
-            for segment, _, label in diarization_result.itertracks(yield_label=True):
+            for segment, _, label in annotation.itertracks(yield_label=True):
                 if label == speaker:
                     speaker_segments.append(segment)
                     total_seconds += segment.duration
